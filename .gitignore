@@ -1,25 +1,28 @@
-Config
+Datasets/
+Output/
+Tmp/
+Visualize/
+
+__pycache__/
+.ipynb_checkpoints/
+
 Config/*
+!Config/DecoupleNet.json
 
-Datasets
-Datasets/*
-
-Output
-Output/*
-
-Tmp
-Tmp/*
-
-Models/
 Models/*
 !Models/iwe.py
 !Models/flow_metrics.py
+!Models/DecoupleNet.py
+!Models/util.py
+!Models/Modules/base.py
 
 Tools/__pycache__
 Tools/.ipynb_checkpoints
 
-__pycache__
-__pycache__/*
-
-.ipynb_checkpoints
-.ipynb_checkpoints/*
+.gitignore
+*.png
+*.sh
+cam_vis.py
+plot_syn.py
+prepare_dsec_submission.py
+visual.py

@@ -142,7 +142,7 @@ class StreamDataset(IterableDataset):
         split_size = split_sizes[worker_id]
 
         if len(self) < split_size:
-            print('worker#', worker_id, f': Stopping... Number of streams {len(self)} < split_size {split_size}')
+            print('worker#', worker_id, ': Stopping... Number of streams < split_size')
             raise StopIteration
 
         """
@@ -196,8 +196,6 @@ class StreamDataLoader(object):
                 padding_value=None,
                 shuffle=True,
                 num_workers=1,
-                max_num_events=0,
-                need_pad=False,
                 collate_fn=data_func.custom_collate, 
                 ):
         mutex = multiprocessing.Lock()
@@ -214,12 +212,11 @@ class StreamDataLoader(object):
             num_workers=num_workers,
             collate_fn=lambda x: x,
             pin_memory=True,
-            drop_last=False,)
+            drop_last=False,
+            prefetch_factor=8)
         self.collate_fn = collate_fn
         self.num_workers = max(1, num_workers)
         self.shuffle = shuffle
-        self.max_num_events = max_num_events
-        self.need_pad = need_pad
 
     def __iter__(self):
         if self.shuffle:
@@ -238,7 +235,7 @@ class StreamDataLoader(object):
                 all_pad = all([item == self.dataset.padding_value for item in batch])
                 if all_pad:
                     continue
-                batch = self.collate_fn(batch, self.max_num_events, self.need_pad)
+                batch = self.collate_fn(batch)
                 yield batch
 
         # Empty remaining cache
@@ -260,16 +257,13 @@ class Map:
         self.ts = []
         self.names = []
         self.event_idx = []
-        self.ts_from = []
-        self.ts_to = []
 
     def __call__(self, name, h5obj):
         if hasattr(h5obj, "dtype") and name not in self.names:
             self.names += [name]
-            self.ts += [h5obj.attrs.get("timestamp", None)]
-            self.event_idx += [h5obj.attrs.get('event_idx', None)]
-            self.ts_from += [h5obj.attrs.get("timestamp_from", None)]
-            self.ts_to += [h5obj.attrs.get("timestamp_to", None)]
+            self.ts += [h5obj.attrs["timestamp"]]
+            if 'event_idx' in h5obj.attrs.keys():
+                self.event_idx += [h5obj.attrs['event_idx']]
 
 class H5Stream(object):
     def __init__(self,
@@ -287,7 +281,6 @@ class H5Stream(object):
                 predict_load,
                 predict_dir,
                 round_ts,
-                rectify,
                 **kwargs):
 
         self.file = h5py.File(file_name, "r")
@@ -305,38 +298,12 @@ class H5Stream(object):
         self.predict_load = predict_load
         self.predict_dir = predict_dir
         self.round_ts = round_ts
-        self.rectify = rectify
-
-        if "ts" in self.file['events'].keys():
-            kn = {'t': 'events/ts', 'x': 'events/xs', 'y': 'events/ys', 'p': 'events/ps'}
-        else:
-            kn = {'t': 'events/t', 'x': 'events/x', 'y': 'events/y', 'p': 'events/p'}
-
-        t0 = self.file[kn['t']][0]
-        if 't0' in self.file.attrs.keys():
-            t0 = self.file.attrs['t0']
-
-        self.events = {'x': self.file[kn['x']][:], 
-                       'y': self.file[kn['y']][:], 
-                       't': (self.file[kn['t']][:] - t0) * 1e6,
-                       'p': self.file[kn['p']][:]}
 
         self.augmentation = []
         for i, mechanism in enumerate(augmentation):
             if np.random.random() < augment_prob[i]:
                 self.augmentation.append(mechanism)
-        
-        self.rect_dict = None
-        if self.rectify:
-            self.rectify_map = self.file["rectification/rectify_map"][:]
-            self.rect_dict = data_func.rectification_mapping(
-                eval(self.file["calibration/intrinsics"][()]),
-                eval(self.file["calibration/extrinsics"][()]),
-                eval(self.file["calibration/disparity_to_depth"][()]),
-                self.resolution,
-                self.augmentation
-                )
-  
+
     def hot_filter(self, batch, event_voxel, event_cnt, event_mask):
         hot_mask = self.create_hot_mask(event_cnt, batch)
         hot_mask_voxel = torch.stack([hot_mask] * self.num_bins, axis=2).permute(2, 0, 1)
@@ -384,8 +351,8 @@ class H5Stream(object):
         # ts -= self.events['t0']  # sequence starting at t0 = 0
 
         # handle case with very few events
-        # if xs.shape[0] <= 10:
-        #     xs, ys, ts, ps = np.split(np.empty([40, 0]), 4)
+        # if xs.shape[0] <= 100:
+        #     xs, ys, ts, ps = np.split(np.empty([4 * int(1e3), 0]), 4)
 
         # event formatting and timestamp normalization
         dt_input = np.asarray(0.0)
@@ -395,36 +362,29 @@ class H5Stream(object):
         last_ts = ts[-1]
         xs, ys, ts, ps = data_func.event_formatting(xs, ys, ts, ps)
 
-        rect_xs, rect_ys = None, None
-        if self.rectify:
-            rect_events = self.rectify_map[ys.astype(np.int64), xs.astype(np.int64)]
-            rect_xs = rect_events[:, 0]
-            rect_ys = rect_events[:, 1]
-            rect_xs, rect_ys, _ = data_func.augment_events(rect_xs, rect_ys, ps, self.augmentation, self.resolution)
-
         # data augmentation
         xs, ys, ps = data_func.augment_events(xs, ys, ps, self.augmentation, self.resolution)
 
-        return {'x':xs, 
-                'y':ys, 
-                't':ts, 
-                'p':ps, 
-                'dt':dt_input, 
-                'last_ts':last_ts,
-                'rect_x':rect_xs,
-                'rect_y':rect_ys}
+        return xs, ys, ts, ps, dt_input, last_ts
 
-    def __iter__(self):  
+    def __iter__(self):
+        if "ts" in self.file['events'].keys():
+            kn = {'t': 'events/ts', 'x': 'events/xs', 'y': 'events/ys', 'p': 'events/ps'}
+        else:
+            kn = {'t': 'events/t', 'x': 'events/x', 'y': 'events/y', 'p': 'events/p'}
+    
+        self.events= {'x':self.file[kn['x']],
+                'y':self.file[kn['y']],
+                't':self.file[kn['t']],
+                'p':self.file[kn['p']],}  
         cur_ts = 0
 
-        for cur_idx in self.idx_list:
+        for cur_idx, next_idx in zip(self.idx_list[:-1], self.idx_list[1:]):
             # load events
-            if (cur_idx[1] - cur_idx[0]) < 10:
-                continue
- 
-            evs = self.load_events(cur_idx)
-            event_cnt = data_func.ev_to_channels(evs, self.resolution)
+            xs, ys, ts, ps, dt_input, seq_last_ts = self.load_events(cur_idx)            
+            event_cnt = data_func.ev_to_channels(xs, ys, ps, self.resolution)
             event_mask = (event_cnt[0] + event_cnt[1]) > 0
+            event_mask = event_mask
 
             # # hot pixel removal
             # if self.config["hot_filter"]["enabled"]:
@@ -436,7 +396,7 @@ class H5Stream(object):
                 frames = None
                 idx = self.maps.names[int(np.ceil(cur_ts + self.window))][-6:]
 
-            dt_gt = 0.1
+            dt_gt = 0.0
             if self.mode in ["flow_dt1", "flow_dt4"]:
                 flow_map, dt_gt = self.load_flow(self.file, self.maps, cur_ts)
                 idx = self.maps.names[int(np.ceil(cur_ts + self.window))][-6:]
@@ -444,71 +404,44 @@ class H5Stream(object):
             dt_gt = np.asarray(dt_gt)
 
             # prepare output
-            # '''
-            # Only for 'time' mode, choosing the fixed number events
-            # '''
-            # if self.mode == "time":
-            #     if xs.shape[0] <= 3e3:
-            #         xs = np.pad(xs, pad_width=(0, int(3e3) - xs.shape[0]), mode='reflect')
-            #         ys = np.pad(ys, pad_width=(0, int(3e3) - ys.shape[0]), mode='reflect')
-            #         ts = np.pad(ts, pad_width=(0, int(3e3) - ts.shape[0]), mode='reflect')
-            #         ps = np.pad(ps, pad_width=(0, int(3e3) - ps.shape[0]), mode='constant', constant_values=0)
-            #     randind = np.random.choice(xs.shape[0], size=int(3e3), replace=False)
-            #     xs, ys, ts, ps = xs[randind], ys[randind], ts[randind], ps[randind]
-
-            if self.rectify:
-                event_list = np.stack([evs['t'], evs['rect_x'], evs['rect_y'], evs['p']], axis=-1).astype(np.float32)
-            else:
-                event_list = np.stack([evs['t'], evs['x'], evs['y'], evs['p']], axis=-1).astype(np.float32)
+            '''
+            Only for 'time' mode, choosing the fixed number events
+            '''
+            if self.mode == "time":
+                if xs.shape[0] <= 3e3:
+                    xs = np.pad(xs, pad_width=(0, int(3e3) - xs.shape[0]), mode='reflect')
+                    ys = np.pad(ys, pad_width=(0, int(3e3) - ys.shape[0]), mode='reflect')
+                    ts = np.pad(ts, pad_width=(0, int(3e3) - ts.shape[0]), mode='reflect')
+                    ps = np.pad(ps, pad_width=(0, int(3e3) - ps.shape[0]), mode='constant', constant_values=0)
+                randind = np.random.choice(xs.shape[0], size=int(3e3), replace=False)
+                xs, ys, ts, ps = xs[randind], ys[randind], ts[randind], ps[randind]
+            event_list = np.stack([ts, xs, ys, ps], axis=-1).astype(np.float32)
 
             output = {
                 'cur_ts': cur_ts,
-                'ts': evs['last_ts'],
+                'ts': seq_last_ts,
                 'name': self.sequence_name,
                 'idx': idx,
                 'dt_gt': torch.from_numpy(dt_gt),
-                'dt_input': torch.from_numpy(evs['dt']),
+                'dt_input': torch.from_numpy(dt_input),
                 'file_name': self.fname,
                 'event_list': torch.from_numpy(event_list),
                 'event_mask': torch.from_numpy(event_mask).float(),
                 'event_cnt': torch.from_numpy(event_cnt),
             }
 
-            if self.mode == "images":
-                # frames = self.load_frames(self.file, self.maps, cur_ts)
-                frames = None
+            if self.mode == "frames":
+                output['frames'] = torch.from_numpy(frames)
             elif self.mode in ["flow_dt1", "flow_dt4"]:
                 output['gtflow'] = torch.from_numpy(flow_map)
-            
-            if self.encoding == 'cnt':
-                output['input'] = torch.from_numpy(event_cnt)
-            elif self.encoding == 'timesurface':
-                timesurface = data_func.ev_to_timesurface(evs, self.num_bins, self.resolution)
-                output['input'] = torch.from_numpy(timesurface)
-            elif self.encoding == 'mixture':
-                timesurface = data_func.ev_to_timesurface(evs, self.num_bins, self.resolution)
-                output['input'] = torch.from_numpy(np.concatenate([event_cnt, timesurface]))
-            elif self.encoding == 'list':
-                output['input'] = torch.from_numpy(event_list)
-            elif self.encoding == '3Dcnt':
-                cnt = data_func.ev_to_3Dcnt(evs, self.num_bins, self.resolution)
-                output['input'] = torch.from_numpy(cnt)
-            elif self.encoding == '3Dgauss':
-                cnt = data_func.ev_to_3Dgauss(evs, self.num_bins, self.resolution)
-                output['input'] = torch.from_numpy(cnt)
-            elif self.encoding == '3Dvoxel':
-                cnt = data_func.ev_to_voxel(evs, self.num_bins, self.resolution)
-                output['input'] = torch.from_numpy(cnt)
-            elif self.encoding == '3Dunivoxel':
-                cnt = data_func.ev_to_univoxel(evs, self.num_bins, self.resolution)
-                output['input'] = torch.from_numpy(cnt)
 
-            if self.rectify:
-                if self.encoding != 'list':
-                    output['input'] = data_func.rect_repr(output['input'], rect_map=self.rect_dict['map'])
+            cur_vox = data_func.ev_to_voxel(xs, ys, ts, ps, self.num_bins, self.resolution)
+            cur_vox = torch.from_numpy(cur_vox)
 
-                output['event_cnt'] = data_func.rect_repr(output['event_cnt'], rect_map=self.rect_dict['map'])
-                output['event_mask'] = (output['event_cnt'][0] + output['event_cnt'][1]) > 0
+            xs, ys, ts, ps, dt_input, seq_last_ts = self.load_events(next_idx)
+            next_vox = data_func.ev_to_voxel(xs, ys, ts, ps, self.num_bins, self.resolution)
+            next_vox = torch.from_numpy(next_vox)            
+            output['input'] = torch.stack([cur_vox, next_vox], dim=0)
 
              # update window
             cur_ts += self.window
@@ -530,51 +463,32 @@ class H5Dataloader(StreamDataLoader):
                 predict_dir=None,
                 round_ts=False,
                 shuffle=False,
-                max_num_events=1e9,
-                need_pad=False,
-                rectify=False,
                 **kwargs):
         # input event sequences
         self.files = []
-        self.events = {}
         self.idx_list = {}
         self.maps = {}
 
         if 'VariNum' in augmentation:
             vari = (1 - augment_prob[augmentation.index('VariNum')] * np.random.random())
             window = int(window * vari)
-        print(f'sample events in {mode}: {window}')
+        print(f'sample events: {window}')
 
         for root, dirs, files in os.walk(path):
             for file in files:
-                # if file.endswith("outdoor_day1_data.h5"):
-                # if file.endswith("boxes_6dof.h5"):
+                # if file.endswith("thun_01_a.h5"):
                 if file.endswith(".h5"):
                     fname = os.path.join(root, file)
                     self.get_event_info(fname, mode, window)
                     if debug and len(self.files) == batch_size:
                         break
-    
+
         def iterator_func(file_name):
             idx_list = self.idx_list[file_name]
             maps = self.maps[file_name]
-            return H5Stream(file_name, 
-                            idx_list, 
-                            maps, 
-                            mode, 
-                            window, 
-                            resolution, 
-                            orig_resolution, 
-                            num_bins, 
-                            encoding, 
-                            augmentation, 
-                            augment_prob, 
-                            predict_load, 
-                            predict_dir, 
-                            round_ts,
-                            rectify)
+            return H5Stream(file_name, idx_list, maps, mode, window, resolution, orig_resolution, num_bins, encoding, augmentation, augment_prob, predict_load, predict_dir, round_ts)
             
-        super().__init__(self.files, iterator_func, batch_size=batch_size, num_workers=num_workers, shuffle=shuffle, max_num_events=max_num_events, need_pad=need_pad)
+        super().__init__(self.files, iterator_func, batch_size=batch_size, num_workers=num_workers, shuffle=shuffle)
 
     def get_event_info(self, fname, mode, window):
         '''
@@ -582,21 +496,24 @@ class H5Dataloader(StreamDataLoader):
         UZHFPV 单位为 s
         '''
 
-        unit = 1
-        if ('UZHFPV' in fname) or ('MVSEC' in fname) or ('DSEC' in fname):
+        if ('UZHFPV' in fname) or ('MVSEC' in fname):
             unit = 1e6
-            
+        else:
+            unit = 1
+
         file = h5py.File(fname, "r")
         cur_ts, last_ts = 0, 0
         maps = None
 
-        tn = 'events/t'
         if "ts" in file['events'].keys():
-            tn = 'events/ts'            
+            kn = {'t': 'events/ts', 'x': 'events/xs', 'y': 'events/ys', 'p': 'events/ps'}
+        else:
+            kn = {'t': 'events/t', 'x': 'events/x', 'y': 'events/y', 'p': 'events/p'}
 
-        t0 = file[tn][0]
         if 't0' in file.attrs.keys():
             t0 = file.attrs['t0']
+        else:
+            t0 = file[kn['t']][0]
 
         if mode in ["images", "flow_dt1", "flow_dt4"]:
             maps = Map()
@@ -604,28 +521,26 @@ class H5Dataloader(StreamDataLoader):
             maps.ts = (maps.ts - t0) * unit
             last_ts = len(maps.ts)
         elif mode == "time":
-            last_ts = file[tn][-1] - t0
+            last_ts = file[kn['t']][-1] - t0
             last_ts *= unit
         else:
-            last_ts = len(file[tn])
+            last_ts = len(file[kn['t']])
 
-        ts = (file[tn] - t0) * unit
+        events= {'x':file[kn['x']],
+                'y':file[kn['y']],
+                't':file[kn['t']],
+                'p':file[kn['p']],}
         idx_list = []
-
+        
         ms_to_idx = file['events'].get('ms_to_idx', None)
-
-        if mode == 'time':
-            idx_list = np.searchsorted(ts, np.arange(0, last_ts, window))
-            idx_list = list(zip(idx_list[:-1], idx_list[1:]))
-        else:
-            while self.check_seq(mode, cur_ts, last_ts, window):
-                idx0, idx1 = self.get_event_index(mode, ts, cur_ts, window, maps, ms_to_idx)
-                if mode == 'time':
-                    if (idx1 - idx0) > 100:
-                        idx_list.append((idx0, idx1))
-                else:
+        while self.check_seq(mode, cur_ts, last_ts, window):
+            idx0, idx1 = self.get_event_index(mode, events['t'], cur_ts, window, maps, ms_to_idx)
+            if mode == 'time':
+                if (idx1 - idx0) > 100:
                     idx_list.append((idx0, idx1))
-                cur_ts += window
+            else:
+                idx_list.append((idx0, idx1))
+            cur_ts += window
 
         self.idx_list[fname] = idx_list
         self.maps[fname] = maps
@@ -663,7 +578,7 @@ class H5Dataloader(StreamDataLoader):
             if window < 1.0 and idx1 - idx0 > 1:
                 idx0 += idx1 - idx0 - 1
             
-            if maps.event_idx[idx0] is not None:
+            if len(maps.event_idx) > 0:
                 event_idx0 = maps.ts[idx0]
                 event_idx1 = maps.ts[idx1]
             else:

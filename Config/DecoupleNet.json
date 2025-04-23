@@ -1,0 +1,118 @@
+{
+    "Data": {
+        "num_bins": 1,
+        "encoding": "timesurface",
+        "augmentation": ["Horizontal", "Vertical", "Polarity"],
+        "__augmentation": ["Horizontal", "Vertical", "Polarity", "VariNum"],
+        "augment_prob": [0.5, 0.5, 0.5, 0.75]
+    },
+    
+    "Model": {
+        "name": "DecoupleNet",
+        "base_num_channels": 8,
+        "kernel_size": 3,
+        "num_bins": 1,
+        "num_encoders": 3,
+        "norm_input": false,
+        "norm": null,
+        "activations_ff": "relu",
+        "activations_rec": "tanh",
+        "activation_out": "tanh",
+        "mask_output": true
+    },
+    
+    "Loss": {
+        "resolution": [128, 128],
+        "__resolution": [128, 128],
+        "flow_regul_weight": 0.001,
+        "clip_grad": 100,
+        "overwrite_intermediate": false,
+        "flow_scaling": 128
+    },
+    
+    "Rec": {
+        "dir": "Output",
+        "enable": false,
+        "store": false
+    },
+    
+    "Train_Dataset": {
+        "UZHFPV": {
+            "path": "Datasets/UZHFPV/Optical_Flow",
+            "mode": "events",
+            "__mode": "events/time/frames",
+            "window": 1000,
+            "seq_len": 10,
+            "resolution": [128, 128],
+            "batch_size": 1,
+            "lr": 0.000001,
+            "num_epochs": 1
+        },
+
+        "DSEC": {
+            "path": "Datasets/DSEC/train/dsec_train_128/",
+            "seq_len": 10,
+            "mode": "time",
+            "__mode": "events/time/frames",
+            "window": 10000,
+            "resolution": [128, 128],
+            "batch_size": 8,
+            "lr": 0.00001,
+            "num_epochs": 100,
+            "rectify": true,
+            "max_num_events": 10000
+        }
+    },
+    
+    "Test_Dataset": {
+        "MVSEC": {
+            "name": "MVSEC",
+            "path": "Datasets/MVSEC/h5/",
+            "mode": "flow_dt4",
+            "window": 0.25,
+            "__mode": "events/time/frames",
+            "resolution": [256, 256]
+        },
+
+        "DSEC": {
+            "name": "DSEC",
+            "path": "Datasets/DSEC/test/raw/",
+            "mode": "gtflow",
+            "__mode": "events/time/gtflow",
+            "window": 0.1,
+            "seq_len": 10,
+            "resolution": [480, 640],
+            "rectify": true,
+            "need_pad": false,
+            "max_num_events": null
+        },
+
+        "ECD": {
+            "name": "ECD",
+            "path": "Datasets/ECD",
+            "window": 15000,
+            "mode": "events",
+            "__mode": "events/time/frames",
+            "resolution": [180, 240]
+        },
+
+        "HQF": {
+            "name": "HQF",
+            "path": "Datasets/HQF",
+            "window": 15000,
+            "mode": "events",
+            "__mode": "events/time/frames",
+            "resolution": [180, 240]
+        },
+
+        "tmp": {
+            "name": "tmp",
+            "path": "Datasets/tmp1/1",
+            "window": 15000,
+            "mode": "events",
+            "__mode": "events/time/frames",
+            "resolution": [260, 346]
+        }
+    }
+
+}

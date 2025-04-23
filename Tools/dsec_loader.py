@@ -20,7 +20,7 @@ import h5py
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset
-
+import hdf5plugin
 import data_func
 
 def split_batch_size(batch_size, num_workers):
@@ -142,7 +142,7 @@ class StreamDataset(IterableDataset):
         split_size = split_sizes[worker_id]
 
         if len(self) < split_size:
-            print('worker#', worker_id, f': Stopping... Number of streams {len(self)} < split_size {split_size}')
+            print('worker#', worker_id, ': Stopping... Number of streams < split_size')
             raise StopIteration
 
         """
@@ -214,7 +214,8 @@ class StreamDataLoader(object):
             num_workers=num_workers,
             collate_fn=lambda x: x,
             pin_memory=True,
-            drop_last=False,)
+            drop_last=False,
+            prefetch_factor=2)
         self.collate_fn = collate_fn
         self.num_workers = max(1, num_workers)
         self.shuffle = shuffle
@@ -312,14 +313,14 @@ class H5Stream(object):
         else:
             kn = {'t': 'events/t', 'x': 'events/x', 'y': 'events/y', 'p': 'events/p'}
 
-        t0 = self.file[kn['t']][0]
+        self.t0 = self.file[kn['t']][0]
         if 't0' in self.file.attrs.keys():
-            t0 = self.file.attrs['t0']
+            self.t0 = self.file.attrs['t0']
 
-        self.events = {'x': self.file[kn['x']][:], 
-                       'y': self.file[kn['y']][:], 
-                       't': (self.file[kn['t']][:] - t0) * 1e6,
-                       'p': self.file[kn['p']][:]}
+        self.events = {'x': self.file[kn['x']], 
+                       'y': self.file[kn['y']], 
+                       't': self.file[kn['t']],
+                       'p': self.file[kn['p']]}
 
         self.augmentation = []
         for i, mechanism in enumerate(augmentation):
@@ -358,11 +359,10 @@ class H5Stream(object):
         return frames
 
     def load_flow(self, file, maps, cur_ts):
-        idx = int(np.ceil(cur_ts + self.window))
-        flowmap = file[self.mode][maps.names[idx]][:]
+        idx = int(np.around(cur_ts + self.window))
+        flowmap = file['flow'][maps.names[idx]][:].transpose(2, 0, 1)
         flowmap = data_func.augment_flowmap(flowmap, self.augmentation)
-        if idx > 0:
-            dt_gt = maps.ts[idx] - maps.ts[idx - 1]
+        dt_gt = maps.ts_to[idx] - maps.ts_from[idx - 1]
         return flowmap, dt_gt
 
     def load_events(self, cur_idx):
@@ -376,16 +376,16 @@ class H5Stream(object):
         :return ts: [N] numpy array with event timestamp
         :return ps: [N] numpy array with event polarity ([-1, 1])
         """
-        idx0, idx1 = cur_idx[0], cur_idx[1]
+        idx0, idx1 = int(cur_idx[0]), int(cur_idx[1])
         ys = self.events['y'][idx0:idx1]
         xs = self.events['x'][idx0:idx1]
-        ts = self.events['t'][idx0:idx1]
+        ts = self.events['t'][idx0:idx1] - self.t0
         ps = self.events['p'][idx0:idx1]
         # ts -= self.events['t0']  # sequence starting at t0 = 0
 
         # handle case with very few events
-        # if xs.shape[0] <= 10:
-        #     xs, ys, ts, ps = np.split(np.empty([40, 0]), 4)
+        # if xs.shape[0] <= 100:
+        #     xs, ys, ts, ps = np.split(np.empty([4 * int(1e3), 0]), 4)
 
         # event formatting and timestamp normalization
         dt_input = np.asarray(0.0)
@@ -436,8 +436,8 @@ class H5Stream(object):
                 frames = None
                 idx = self.maps.names[int(np.ceil(cur_ts + self.window))][-6:]
 
-            dt_gt = 0.1
-            if self.mode in ["flow_dt1", "flow_dt4"]:
+            dt_gt = 0.0
+            if self.mode in ["gtflow"]:
                 flow_map, dt_gt = self.load_flow(self.file, self.maps, cur_ts)
                 idx = self.maps.names[int(np.ceil(cur_ts + self.window))][-6:]
                 # frames = self.load_frames(file, maps, cur_ts)
@@ -477,7 +477,7 @@ class H5Stream(object):
             if self.mode == "images":
                 # frames = self.load_frames(self.file, self.maps, cur_ts)
                 frames = None
-            elif self.mode in ["flow_dt1", "flow_dt4"]:
+            elif self.mode in ["gtflow"]:
                 output['gtflow'] = torch.from_numpy(flow_map)
             
             if self.encoding == 'cnt':
@@ -548,13 +548,13 @@ class H5Dataloader(StreamDataLoader):
         for root, dirs, files in os.walk(path):
             for file in files:
                 # if file.endswith("outdoor_day1_data.h5"):
-                # if file.endswith("boxes_6dof.h5"):
+                # if file.endswith("shapes_6dof.h5"):
                 if file.endswith(".h5"):
                     fname = os.path.join(root, file)
                     self.get_event_info(fname, mode, window)
                     if debug and len(self.files) == batch_size:
                         break
-    
+
         def iterator_func(file_name):
             idx_list = self.idx_list[file_name]
             maps = self.maps[file_name]
@@ -577,15 +577,6 @@ class H5Dataloader(StreamDataLoader):
         super().__init__(self.files, iterator_func, batch_size=batch_size, num_workers=num_workers, shuffle=shuffle, max_num_events=max_num_events, need_pad=need_pad)
 
     def get_event_info(self, fname, mode, window):
-        '''
-        统一单位为us
-        UZHFPV 单位为 s
-        '''
-
-        unit = 1
-        if ('UZHFPV' in fname) or ('MVSEC' in fname) or ('DSEC' in fname):
-            unit = 1e6
-            
         file = h5py.File(fname, "r")
         cur_ts, last_ts = 0, 0
         maps = None
@@ -598,24 +589,30 @@ class H5Dataloader(StreamDataLoader):
         if 't0' in file.attrs.keys():
             t0 = file.attrs['t0']
 
-        if mode in ["images", "flow_dt1", "flow_dt4"]:
+        if mode in ["gtflow"]:
             maps = Map()
-            file[mode].visititems(maps)
-            maps.ts = (maps.ts - t0) * unit
-            last_ts = len(maps.ts)
+            file['flow'].visititems(maps)
+            last_ts = len(maps.ts_to) - 1
         elif mode == "time":
             last_ts = file[tn][-1] - t0
-            last_ts *= unit
         else:
             last_ts = len(file[tn])
 
-        ts = (file[tn] - t0) * unit
+        ts = file[tn]
         idx_list = []
 
+        idx_file = file.filename.replace('.h5', '_index.txt')
+        if os.path.exists(idx_file):
+            idx_list = np.loadtxt(idx_file)
+            self.idx_list[fname] = idx_list
+            self.maps[fname] = maps
+            self.files.append(fname)
+            return 1
+        
         ms_to_idx = file['events'].get('ms_to_idx', None)
 
         if mode == 'time':
-            idx_list = np.searchsorted(ts, np.arange(0, last_ts, window))
+            idx_list = np.searchsorted(ts - t0, np.arange(0, last_ts, window))
             idx_list = list(zip(idx_list[:-1], idx_list[1:]))
         else:
             while self.check_seq(mode, cur_ts, last_ts, window):
@@ -626,6 +623,9 @@ class H5Dataloader(StreamDataLoader):
                 else:
                     idx_list.append((idx0, idx1))
                 cur_ts += window
+
+        with open(idx_file, 'w') as f:
+            np.savetxt(idx_file, np.array(idx_list, dtype=np.int32))
 
         self.idx_list[fname] = idx_list
         self.maps[fname] = maps
@@ -657,18 +657,14 @@ class H5Dataloader(StreamDataLoader):
             else:
                 event_idx0 = ms_to_idx[cur_ts // 1000]
                 event_idx1 = ms_to_idx[(cur_ts + window) // 1000]
-        elif mode in ["images", "flow_dt1", "flow_dt4"]:                
-            idx0 = int(np.floor(cur_ts))
-            idx1 = int(np.ceil(cur_ts + window))
-            if window < 1.0 and idx1 - idx0 > 1:
-                idx0 += idx1 - idx0 - 1
-            
-            if maps.event_idx[idx0] is not None:
-                event_idx0 = maps.ts[idx0]
+        elif mode in ["gtflow"]:                
+            idx1 = int(np.around(cur_ts + window))
+            if maps.event_idx[idx1] is not None:
+                event_idx0 = maps.ts[idx1]
                 event_idx1 = maps.ts[idx1]
             else:
-                event_idx0 = data_func.binary_search_array(ts, maps.ts[idx0])
-                event_idx1 = data_func.binary_search_array(ts, maps.ts[idx1])
+                event_idx0 = data_func.binary_search_array(ts, maps.ts_from[idx1])
+                event_idx1 = data_func.binary_search_array(ts, maps.ts_to[idx1])
                 
             if window < 1.0:
                 event_idx0, event_idx1 = data_func.delta_time(cur_ts, window, event_idx0, event_idx1)
@@ -679,7 +675,7 @@ class H5Dataloader(StreamDataLoader):
         return event_idx0, event_idx1
 
     def check_seq(self, mode, cur_ts, last_ts, window):
-        return (mode in ["images", "flow_dt1", "flow_dt4"]
+        return (mode in ["images", "gtflow"]
                     and int(np.ceil(cur_ts + window)) < last_ts) \
                 or (mode in ["time", "events"]
                     and (cur_ts + window) < last_ts)

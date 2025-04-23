@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+import cv2
 
 def ev_to_2Dmap(xs, ys, ws, size=(180, 240), accumulate=True):
     """
@@ -7,7 +9,8 @@ def ev_to_2Dmap(xs, ys, ws, size=(180, 240), accumulate=True):
     """
     img = np.zeros(size, dtype=np.float32)
     if accumulate:
-        img[(ys, xs)] += ws
+        np.add.at(img, (ys, xs), ws)
+        # img[(ys, xs)] += ws
     else:
         img[(ys, xs)] = ws
     return img
@@ -19,49 +22,144 @@ def ev_to_3Dmap(xs, ys, ts, ws, size=(3, 180, 240), accumulate=True):
     """
     img = np.zeros(size, dtype=np.float32)
     if accumulate:
-        img[(ts.astype(int), ys, xs)] += ws
+        x0 = xs.astype(int)
+        y0 = ys.astype(int)
+        for xlim in [x0, x0 + 1]:
+            for ylim in [y0, y0 + 1]:
+                mask = (ylim < size[-2]) & (xlim < size[-1]) & (xlim >= 0) & (ylim >= 0)              
+                ws = ws * (1 - abs(xlim - xs)) * (1 - abs((ylim - ys)))
+                # ti, yi, xi, wi = ts[mask], ys[mask], xs[mask], ws[mask]
+                ti, yi, xi, wi = ts[mask], ylim[mask], xlim[mask], ws[mask]
+                np.add.at(img, (ti.astype(int), yi, xi), wi)
     else:
-        img[(ts.astype(int), ys, xs)] = ws
+        img[(ts.astype(int), ys.astype(int), xs.astype(int))] = ws
     return img
 
-def ev_to_channels(xs, ys, ps, size=(180, 240)):
+def ev_to_channels(evs, size=(180, 240)):
     """
     Generate a two-channel event image containing event counters.
     """
-
+    xs, ys, ps = evs['x'], evs['y'], evs['p']
     assert len(xs) == len(ys) == len(ps)
 
     return np.stack([ev_to_2Dmap(xs, ys, ps * (ps > 0), size), 
                         ev_to_2Dmap(xs, ys, - ps * (ps < 0), size)])
 
-def ev_to_voxel(xs, ys, ts, ps, num_bins, size=(180, 240), round_ts=False):
+def ev_to_3Dcnt(evs, num_bins, size=[180, 240]):
+    """
+    Generate a two-channel event image containing event counters.
+    """
+
+    ts, xs, ys, ps = evs['t'], evs['x'], evs['y'], evs['p']
+    assert len(xs) == len(ys) == len(ts) ==  len(ps)
+
+    size = [num_bins, ] + size
+    ts = ts / ts[-1] * num_bins * 0.99
+
+    return np.stack([ev_to_3Dmap(xs, ys, ts, ps * (ps > 0), size), 
+                    ev_to_3Dmap(xs, ys, ts, - ps * (ps < 0), size)])
+
+def ev_to_3Dgauss(evs, num_bins, size=[180, 240]):
+    ts, xs, ys, ps = evs['t'], evs['x'], evs['y'], evs['p']
+
+    ts = ts / ts[-1]
+    t_avg = ts.mean()
+    t_std = ts.std() + 0.0001 if ts.shape[0] > 1 else 1
+
+    gaussian_part1 = 1 / np.sqrt(2*np.pi) / t_std
+    gaussian_part2 = - (ts - t_avg)**2 / (2 * t_std**2)
+    gaussian_value_at_event = gaussian_part1 * np.exp(gaussian_part2)
+
+    # normalizing factor
+    lam = np.abs(ps).sum() / gaussian_value_at_event.sum()
+    ws = np.ceil(gaussian_value_at_event * lam)
+    
+    num_bins //= 2 #consider the polarity as bins
+    size = [num_bins, ] + size
+    ts = ts * num_bins * 0.99
+
+    ev_map = np.stack([ev_to_3Dmap(xs, ys, ts, ws * (ps > 0), size), 
+                    ev_to_3Dmap(xs, ys, ts, ws * (ps < 0), size)], axis=1)
+
+    ev_map = ev_map.reshape(-1, ev_map.shape[-2], ev_map.shape[-1])
+    return ev_map
+
+def ev_to_voxel(evs, num_bins, size=[180, 240], round_ts=False):
     """
     Generate a voxel grid from input events using temporal bilinear interpolation.
     """
-
+    ts, xs, ys, ps = evs['t'], evs['x'], evs['y'], evs['p']
     assert len(xs) == len(ys) == len(ts) == len(ps)
-
-    ts = ts * (num_bins - 1)
+    size = [num_bins, ] + size
+    ts = ts / ts[-1] * num_bins * 0.99
     if round_ts:
         ts = np.round(ts)
+    
+    ind = ts.astype(np.int32)
 
-    vox = np.zeros((num_bins, ) + size)
-    for b_idx in range(num_bins):
-        weights = np.clip(1.0 - np.abs(ts - b_idx), 0)
-        vox[b_idx] = ev_to_2Dmap(xs, ys, ps * weights, size)
+    vox = ev_to_3Dmap(xs, ys, ind, ps * (1.0 - (ts - ind)), size)
+    vox[1:] += ev_to_3Dmap(xs, ys, ind, ps * (ts - ind), size)[:-1]
+    # for b_idx in range(num_bins):
+    #     weights = np.clip(1.0 - np.abs(ts - b_idx), a_min=0, a_max=1)
+    #     vox[b_idx] = ev_to_2Dmap(xs, ys, ps * weights, size)
 
     return vox
 
-def ev_to_timesurface(xs, ys, ts, ps, num_bins, size=(180, 240)):
-
+def ev_to_univoxel(evs, num_bins, size=[180, 240], round_ts=False):
+    """
+    Generate a voxel grid from input events using temporal bilinear interpolation.
+    """
+    ts, xs, ys, ps = evs['t'], evs['x'], evs['y'], evs['p']
     assert len(xs) == len(ys) == len(ts) == len(ps)
-    tbins = ts / ts[-1] * num_bins
+    size = [num_bins + 1, ] + size
+    tau = ts[-1] / (num_bins + 1)
+
+    ts = ts / tau * 0.99
+    if round_ts:
+        ts = np.round(ts)
+    ind = ts.astype(np.int32)
+
+    vox = ev_to_3Dmap(xs, ys, ind, ps * (ts - ind), size)
+    vox[:-1] += ev_to_3Dmap(xs, ys, ind, ps * (1 - (ts - ind)), size)[1:]
+    # for b_idx in range(num_bins):
+    #     weights = np.clip(1.0 - np.abs(ts - b_idx), a_min=0, a_max=1)
+    #     vox[b_idx] = ev_to_2Dmap(xs, ys, ps * weights, size)
+
+    return vox[:-1]
+
+def ev_to_voxel(evs, num_bins, size=[180, 240], round_ts=False):
+    """
+    Generate a voxel grid from input events using temporal bilinear interpolation.
+    """
+    ts, xs, ys, ps = evs['t'], evs['x'], evs['y'], evs['p']
+    assert len(xs) == len(ys) == len(ts) == len(ps)
+    size = [num_bins, ] + size
+    ts = ts / ts[-1] * num_bins * 0.99
+    if round_ts:
+        ts = np.round(ts)
+    
+    ind = ts.astype(np.int32)
+
+    vox = ev_to_3Dmap(xs, ys, ind, ps * (1.0 - (ts - ind)), size)
+    vox[1:] += ev_to_3Dmap(xs, ys, ind, ps * (ts - ind), size)[:-1]
+    # for b_idx in range(num_bins):
+    #     weights = np.clip(1.0 - np.abs(ts - b_idx), a_min=0, a_max=1)
+    #     vox[b_idx] = ev_to_2Dmap(xs, ys, ps * weights, size)
+
+    return vox
+
+def ev_to_timesurface(evs, num_bins, size=(180, 240)):
+
+    ts, xs, ys, ps = evs['t'], evs['x'], evs['y'], evs['p']
+    assert len(xs) == len(ys) == len(ts) == len(ps)
+    ts = ts - ts[0]
+    tbins = ts / ts[-1] * num_bins * (1 - 1e-6)
     size = (num_bins,) + tuple(size)
-    tbins[tbins == num_bins] = num_bins - 1
     timg = ev_to_3Dmap(xs, ys, tbins, ts, size)
     cimg = ev_to_3Dmap(xs, ys, tbins, np.ones_like(ps), size)
 
-    timg = timg / (cimg + 1e-9)
+    timg = timg / (cimg + 1e-6)
+    timg = timg / timg.max()
     return timg
 
 
@@ -124,7 +222,7 @@ def binary_search_array(array, x, left=None, right=None, side="left"):
 
     return binary_search_array(array, x, left=mid + 1, right=right)
 
-def delta_time(ts, window):
+def delta_time(ts, window, event_idx0, event_idx1):
     floor_row = int(np.floor(ts))
     ceil_row = int(np.ceil(ts + window))
     if ceil_row - floor_row > 1:
@@ -217,10 +315,84 @@ def augment_events(xs, ys, ps, augmentation=["Horizontal", "Vertical", "Polarity
 
     return xs, ys, ps
 
+def rectification_mapping(intrinsics, extrinsics, disparity_to_depth, res, augmentation:list=[]):
+    """
+    Compute the backward rectification map for the input representations.
+    See https://github.com/uzh-rpg/DSEC/issues/14 for details.
+    :param batch: batch index
+    :return K_rect: intrinsic matrix of rectified image
+    :return mapping: rectification map
+    :return Q_rect: scaling matrix to convert disparity to depth
+    """
 
-import torch
+    # distorted image
+    K_dist = intrinsics["cam0"]["camera_matrix"]
 
-def custom_collate(batch):
+    # rectified image
+    K_rect = intrinsics["camRect0"]["camera_matrix"]
+    R_rect = extrinsics["R_rect0"]
+    dist_coeffs = intrinsics["cam0"]["distortion_coeffs"]
+
+    # formatting
+    K_dist = np.array([[K_dist[0], 0, K_dist[2]], [0, K_dist[1], K_dist[3]], [0, 0, 1]])
+    K_rect = np.array([[K_rect[0], 0, K_rect[2]], [0, K_rect[1], K_rect[3]], [0, 0, 1]])
+    R_rect = np.array(
+        [
+            [R_rect[0][0], R_rect[0][1], R_rect[0][2]],
+            [R_rect[1][0], R_rect[1][1], R_rect[1][2]],
+            [R_rect[2][0], R_rect[2][1], R_rect[2][2]],
+        ]
+    )
+    dist_coeffs = np.array([dist_coeffs[0], dist_coeffs[1], dist_coeffs[2], dist_coeffs[3]])
+
+    # backward mapping
+    mapping = cv2.initUndistortRectifyMap(
+        K_dist,
+        dist_coeffs,
+        R_rect,
+        K_rect,
+        (res[1], res[0]),
+        cv2.CV_32FC2,
+    )[0]
+
+    # disparity to depth (onyl used for evaluation)
+    Q_rect = disparity_to_depth["cams_03"]
+    Q_rect = np.array(
+        [
+            [Q_rect[0][0], Q_rect[0][1], Q_rect[0][2], Q_rect[0][3]],
+            [Q_rect[1][0], Q_rect[1][1], Q_rect[1][2], Q_rect[1][3]],
+            [Q_rect[2][0], Q_rect[2][1], Q_rect[2][2], Q_rect[2][3]],
+            [Q_rect[3][0], Q_rect[3][1], Q_rect[3][2], Q_rect[3][3]],
+        ]
+    ).astype(np.float32)
+
+    if "Horizontal" in augmentation:
+        K_rect[0, 2] = res[1] - 1 - K_rect[0, 2]
+        mapping[:, :, 0] = res[1] - 1 - mapping[:, :, 0]
+        mapping = np.flip(mapping, axis=1)
+        Q_rect[0, 3] = -K_rect[0, 2]
+
+    if "Vertical" in augmentation:
+        K_rect[1, 2] = res[0] - 1 - K_rect[1, 2]
+        mapping[:, :, 1] = res[0] - 1 - mapping[:, :, 1]
+        mapping = np.flip(mapping, axis=0)
+        Q_rect[1, 3] = -K_rect[1, 2]
+
+    return {'K': K_rect,
+            'Q': Q_rect,
+            'map': mapping
+            }
+
+def rect_repr(x, rect_map):
+    x = x.permute(1, 2, 0).numpy()
+    x = cv2.remap(x, rect_map, None, cv2.INTER_NEAREST)
+    x = torch.tensor(x)
+    if x.dim() == 2:
+        x = x.unsqueeze(-1)
+    x = x.permute(2, 0, 1)
+    return x
+
+def custom_collate(batch, max_num_events, need_pad=False):
     """
     Collects the different event representations and stores them together in a dictionary.
     """
@@ -230,10 +402,18 @@ def custom_collate(batch):
             batch_dict[k].append(v)
     for k, v in batch_dict.items():
         if type(v[0]) is torch.Tensor:
-            # if k == 'event_list':
-            #     batch_dict[k] = pad_sequence(v, batch_first=True)
-            # else:
-            batch_dict[k] = torch.stack(v)
+            if need_pad and k in ['event_list']:
+                batch_dict[k] = torch.nn.utils.rnn.pad_sequence(v, batch_first=True, padding_value=0)
+                sample_mask = torch.ones(batch_dict[k].shape[0], batch_dict[k].shape[1], dtype=torch.bool)
+                if sample_mask.size(1) > max_num_events:
+                    sample_idx = torch.multinomial(sample_mask.float(), max_num_events, replacement=False)
+                    sample_mask[torch.arange(sample_mask.size(0))[:, None], sample_idx] = 0
+                    sample_mask = ~sample_mask
+            else:
+                batch_dict[k] = torch.stack(v)
+                if k in ['event_list']:
+                    sample_mask = torch.ones(batch_dict[k].shape[0], batch_dict[k].shape[1], dtype=torch.bool)
+    batch_dict['sample_mask'] = sample_mask
 
     # events = []
     # for i, d in enumerate(batch_dict["event_list"]):
